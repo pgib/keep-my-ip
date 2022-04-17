@@ -1,0 +1,154 @@
+#!/usr/bin/env ruby
+# vim: ft=ruby
+#
+
+require 'optparse'
+require 'bundler'
+
+Bundler.require
+
+require 'aws-sdk-route53'
+require 'aws-sdk-ec2'
+#require 'pry'
+require 'net/https'
+
+Aws.config.update({
+  region: ENV['AWS_REGION'] || 'us-west-2',
+})
+
+options = {}
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: #{__FILE__} [options]"
+
+  #opts.on("-v", "--[no-]verbose", "Run verbosely") do |value|
+  #  options[:verbose] = value
+  #end
+
+  opts.on("-z", "--zone-id ZONE_ID", "The Route 53 zone ID") do |value|
+    options[:hosted_zone_id] = value
+  end
+
+  opts.on("-r", "--record-name RECORD_NAME", "The record name to check and update") do |value|
+    options[:record_name] = value
+  end
+
+  opts.on("-i", "--ip-url IP_URL", "A URL that when requested returns your IP address.") do |value|
+    options[:ip_url] = value
+  end
+
+  opts.on("-g", "--security-group-id SECURITY_GROUP_ID", "The security group ID into which we want to whitelist our IP for SSH access (optional)") do |value|
+    options[:security_group_id] = value
+  end
+
+  opts.on_tail('-h', '--help', 'Show this message') do
+    puts opts
+  end
+end
+
+parser.parse!
+
+# Only the --security-group-id option is optional
+unless options[:hosted_zone_id] && options[:record_name] && options[:ip_url]
+  puts parser.help
+  exit
+end
+
+route53_client = Aws::Route53::Client.new
+zone = route53_client.get_hosted_zone(id: options[:hosted_zone_id])
+
+record_set = route53_client.list_resource_record_sets({
+  hosted_zone_id: options[:hosted_zone_id],
+  start_record_name: "#{options[:record_name]}.#{zone.hosted_zone.name}",
+  start_record_type: 'A',
+  max_items: 1
+})
+
+# TODO: Handle no record found
+last_ip = record_set.resource_record_sets.first.resource_records.first.value
+
+uri = URI.parse(options[:ip_url])
+http = Net::HTTP.new(uri.host, uri.port)
+http.use_ssl = true
+request = Net::HTTP::Get.new(uri.request_uri)
+response = http.request(request)
+
+current_ip = response.body.strip
+
+hostname = "#{options[:record_name]}.#{zone.hosted_zone.name}"
+
+if last_ip != current_ip
+  puts "IP address changed from #{last_ip} to #{current_ip}. Updating DNS for #{hostname}..."
+  # Create a Route53 changeset
+  response = route53_client.change_resource_record_sets({
+    change_batch: {
+      changes: [
+        {
+          action: 'UPSERT',
+          resource_record_set: {
+            name: hostname,
+            resource_records: [
+              {
+                value: current_ip
+              }
+            ],
+            type: 'A',
+            ttl: 60,
+          },
+        },
+      ],
+    },
+    hosted_zone_id: options[:hosted_zone_id]
+  })
+
+  change_id = response.change_info.id
+
+  status = response.change_info.status
+
+  print "Waiting for change to be confirmed"
+  while (status == 'PENDING') do
+    response = route53_client.get_change({ id: change_id })
+    status = response.change_info.status
+    print "."
+    sleep 3
+  end
+  print " Confirmed!\n"
+end
+
+# If a security_group_id was specified, ensure there is an ingress rule
+# that allows traffic from our IP address
+if options[:security_group_id]
+  ec2_client = Aws::EC2::Client.new
+  
+  groups = ec2_client.describe_security_groups({ group_ids: [ options[:security_group_id] ] })
+
+  group = groups.security_groups.first
+
+  unless group
+    puts "No security group with ID #{options[:security_group_id]} found."
+    exit 1
+  end
+
+  cidr_ip = "#{current_ip}/32"
+
+  permission = group.ip_permissions.detect { |ipp| ipp.ip_ranges.detect { |ipr| ipr.cidr_ip == cidr_ip } }
+
+  unless permission
+    puts "Adding ingress rule to #{options[:security_group_id]} for #{cidr_ip}:22..."
+    security_group = Aws::EC2::SecurityGroup.new(id: group.group_id, client: ec2_client)
+    security_group.authorize_ingress({
+      ip_permissions: [
+        {
+          from_port: 22,
+          to_port: 22,
+          ip_protocol: 'tcp',
+          ip_ranges: [
+            {
+              cidr_ip: cidr_ip,
+              description: "#{options[:record_name]}.#{zone.hosted_zone.name[0...-1]} by keep-my-ip on #{Time.now.strftime('%Y-%m-%d')}",
+            }
+          ],
+        },
+      ]
+    })
+  end
+end
