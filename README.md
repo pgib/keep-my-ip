@@ -38,6 +38,8 @@ Whatever user runs this script should have AWS credentials already set up either
             "Effect": "Allow",
             "Action": [
                 "route53:ListHostedZones",
+                "route53:GetHostedZone",
+                "route53:ListResourceRecordSets",
                 "route53:GetChange"
             ],
             "Resource": "*"
